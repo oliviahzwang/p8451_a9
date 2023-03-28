@@ -1,0 +1,278 @@
+---
+title: "P8451 Machine Learning in Public Health - Assignment 9"
+output: word_document
+date: "2023-3-28"
+---
+
+As instructed, this analysis will be modeled based on the demonstration code from session 9. In preparation for all the analyses below, we will load the following libraries: 
+
+```{r}
+library(lattice)
+library(NHANES)
+library(dplyr)
+library(caret)
+library(randomForest)
+```
+
+# Part 0: Data Preprocessing
+
+## Data Import and Cleaning 
+
+We will begin by importing the __NHANES__ data and processing it. 
+
+1. Subsetting the data to only include the relevant features
+2. Removing observations with missing values
+
+Remember from our prior assignment the data are imbalanced, so we will need to deal with this during our analysis.
+
+```{r data_prep}
+data ("NHANES")
+table(NHANES$Diabetes)
+
+keep.var<-names(NHANES) %in% c("Age", "Race1", "Education", "Poverty", "Weight", "Height", "Pulse", "Diabetes", "BMI", "PhysActive", "Smoke100", "BPSysAve", "BPDiaAve", "TotChol")
+
+NHANES.subset<-NHANES[keep.var]
+
+str(NHANES.subset)
+
+#Remove missing values and then remove duplicates
+NHANES.subset<-na.omit(NHANES.subset)
+NHANES.subset<-unique(NHANES.subset)
+
+#Check distributions
+summary(NHANES.subset)
+
+```
+
+## Partitioning Data
+
+For the purposes of this analysis, we will partition the data into training and testing using a 70/30 split. This process involves applying the `createDataPartition` function to generate a set of training and testing data with equal proportion of individual with the outcome of interest, i.e., `Diabetes`. The new object `train.data` contains all the indexes of the rows in the original data set contained in the 70% split. The rows indexed to be in the 70% is assigned to a new training data set, and the remaining 30% is assigned to a new `test.data` object. 
+
+```{r partition}
+
+set.seed(123)
+
+training.data<-createDataPartition(NHANES.subset$Diabetes, p=0.7, list=F)
+train.data<-NHANES.subset[training.data, ]
+test.data<-NHANES.subset[-training.data, ]
+
+```
+
+# Part I: Creating Three Different Models
+
+For the purposes of this analysis, we will create and compare the following models: 
+
+1. Random Forest Model with 3 values of mtry and 3 values of ntree
+1. Support Vector Classifier Model 
+1. Logistic Regression Model
+
+## 1.1 Model 1: Random Forest Model with 3 values of mtry and 3 values of ntree
+
+As directed, _up sampling_ was used in efforts in the following analysis to improve model performance.
+
+```{r}
+# Try mtry of all, half of all, sqrt of all, 
+# Try ntree of 100, 300, 500
+feat.count<-c((ncol(train.data)-1), (ncol(train.data)-1)/2, sqrt(ncol(train.data)-1))
+grid.rf<-expand.grid(mtry=feat.count)
+
+control.obj<-trainControl(method="cv", number=5, sampling="up")
+
+tree.num<-seq(100,500, by=200)
+results.trees<-list()
+for (ntree in tree.num){
+  set.seed(123)
+    rf.nhanes<-train(Diabetes~., data=train.data, method="rf", trControl=control.obj, metric="Accuracy", tuneGrid=grid.rf, importance=TRUE, ntree=ntree)
+    index<-toString(ntree)
+  results.trees[[index]]<-rf.nhanes$results
+}
+
+output.nhanes<-bind_rows(results.trees, .id = "ntrees")
+best.tune<-output.nhanes[which.max(output.nhanes[,"Accuracy"]),]
+best.tune$mtry
+results.trees
+mtry.grid<-expand.grid(.mtry=best.tune$mtry)
+
+set.seed(123)
+    rf.nhanes.bt<-train(Diabetes~., data=train.data, method="rf", trControl=control.obj, metric="Accuracy", tuneGrid=mtry.grid, importance=TRUE, ntree=as.numeric(best.tune$ntrees))
+
+confusionMatrix(rf.nhanes.bt)
+varImp(rf.nhanes.bt)
+varImpPlot(rf.nhanes.bt$finalModel)
+```
+Based on the output above, the average accuracy of Random Forest model is __0.8855__. 
+
+## 1.2 Model 2: Support Vector Classifier
+
+To generate an SVC model, we will use the `trainControl` function to set our validation method. Next, we will incorporate different values for cost (C) into the model. We will also show information about the final model, and generate the metrics of accuracy from training using the `confusionMatrix` function. 
+
+```{r}
+set.seed(123)
+
+control.obj<-trainControl(method="cv", number=5, sampling="up", classProbs = TRUE)
+
+#Repeat expanding the grid search
+set.seed(123)
+
+svc.nhanes<-train(Diabetes ~ ., data=train.data, method="svmLinear", trControl=control.obj, preProcess=c("center", "scale"), probability=TRUE, tuneGrid=expand.grid(C=33.33))
+
+svc.nhanes$bestTune
+svc.nhanes$results
+confusionMatrix(svc.nhanes)
+```
+Based on the output above, the average accuracy of Support Vector Classifier model is __0.7534__. 
+
+## 1.3 Model 3: Logistic Regression
+
+We will employ a similar approach as demonstrated in Parts 1.1 and 1.2 to generate a logistic regression model. First, we will use the `trainControl` function to set our validation method, and we will train the algorithm by setting `model = glm`. 
+
+```{r}
+set.seed(123)
+
+control.obj<-trainControl(method="cv", number=5, sampling="up")
+
+log.nhanes<-train(Diabetes~., data=train.data, method="glm", family="binomial",preProcess=c("center", "scale"), trControl=control.obj)
+
+log.nhanes$results
+confusionMatrix(log.nhanes)
+coef(log.nhanes$finalModel)
+
+```
+Based on the output above, the accuracy of the Logistic Regression model is __0.7449__. 
+
+# Part II: Comparing Three Different Models
+
+We will now generate predicted probabilities from each of the three models applied within the testing dataset, and plot and compare calibration curves across the three algorithms. 
+
+## 2.1 Generating Predicted Probabilities
+
+```{r}
+#Predict in test-set and output probabilities
+rf.probs<-predict(rf.nhanes, test.data, type="prob")
+
+#Pull out predicted probabilities for Diabetes=Yes
+rf.pp<-rf.probs[,2]
+
+svc.probs<-predict(svc.nhanes,test.data, type="prob")
+svc.pp<-svc.probs[,2]
+
+#Predict in test-set using response type
+log.probs<-predict(log.nhanes, test.data, type="prob")
+logit.pp<-log.probs[,2]
+```
+
+## 2.2 Plot & Compare Calibration Curves
+
+```{r}
+pred.prob<-data.frame(Class=test.data$Diabetes, logit=logit.pp, rf=rf.pp, svc=svc.pp)
+
+calplot<-(calibration(Class ~ logit+rf+svc, data=pred.prob, class="Yes", cuts=10))
+
+xyplot(calplot, auto.key=list(columns=3))
+```
+
+# Part III: Calibrating Probabilities
+
+Below we calibrate the probabilites of all three models generated above in Part I. To do so, we partition testing data into 2 sets: set to train calibration and then set to evaluate results. We will employ the Platt's Scaling method to train a LR model on the outputs of the classifier.
+
+```{r}
+set.seed(123)
+cal.data.index<-test.data$Diabetes%>% createDataPartition(p=0.5, list=F)
+cal.data<-test.data[cal.data.index, ]
+final.test.data<-test.data[-cal.data.index, ]
+```
+
+
+## 3.1 Calibration of Random Forest Model
+
+```{r}
+#Predict on test-set without scaling to obtain raw pred prob in test set
+rf.probs.nocal<-predict(rf.nhanes, final.test.data, type="prob")
+rf.pp.nocal<-rf.probs.nocal[,2]
+
+#Apply model developed on training data to calibration dataset to obtain predictions
+rf.probs.cal<-predict(rf.nhanes, cal.data, type="prob")
+rf.pp.cal<-rf.probs.cal[,2]
+
+#Add to dataset with actual values from calibration data
+calib.rf.data.frame<-data.frame(rf.pp.cal, cal.data$Diabetes)
+colnames(calib.rf.data.frame)<-c("x", "y")
+
+#Use logistic regression to model predicted probabilities from calibration data to actual vales
+calib.rf.model<-glm(y ~ x, data=calib.rf.data.frame, family = binomial)
+
+#Apply calibration model above to raw predicted probabilities from test set
+data.test.rf<-data.frame(rf.pp.nocal)
+colnames(data.test.rf)<-c("x")
+platt.data.rf<-predict(calib.rf.model, data.test.rf, type="response")
+
+platt.prob.rf<-data.frame(Class=final.test.data$Diabetes, rf.platt=platt.data.rf, rf=rf.pp.nocal)
+
+calplot.rf<-(calibration(Class ~ rf.platt+rf, data=platt.prob.rf, class="Yes", cuts=10))
+xyplot(calplot.rf, auto.key=list(columns=2))
+```
+
+## 3.2 Calibration of Support Vector Classifier
+
+```{r}
+#Predict on test-set without scaling
+svc.probs.nocal<-predict(svc.nhanes,final.test.data, type="prob")
+svc.pp.nocal<-svc.probs.nocal[,2]
+
+#Apply model developed on training data to calibration dataset to obtain predictions
+svc.probs.cal<-predict(svc.nhanes,cal.data, type="prob")
+svc.pp.cal<-svc.probs.cal[,2]
+
+#Add to dataset with actual values from calibration data
+calib.svc.data.frame<-data.frame(svc.pp.cal, cal.data$Diabetes)
+colnames(calib.svc.data.frame)<-c("x", "y")
+calib.svc.model<-glm(y ~ x, data=calib.svc.data.frame, family = binomial)
+
+#Predict on test set using model developed in calibration
+data.test.svc<-data.frame(svc.pp.nocal)
+colnames(data.test.svc)<-c("x")
+platt.data.svc<-predict(calib.svc.model, data.test.svc, type="response")
+
+platt.prob.svc<-data.frame(Class=final.test.data$Diabetes, svc.platt=platt.data.svc,  svc=svc.pp.nocal)
+
+calplot<-(calibration(Class ~ svc.platt+svc, data=platt.prob.svc, class="Yes", cuts=10))
+xyplot(calplot, auto.key=list(columns=2))
+```
+
+## 3.3 Calibration of Logistic Regression
+
+```{r}
+#Predict on test-set without scaling to obtain raw pred prob in test set
+log.probs.nocal<-predict(log.nhanes, final.test.data, type="prob")
+log.pp.nocal<-log.probs.nocal[,2]
+
+#Apply model developed on training data to calibration dataset to obtain predictions
+log.probs.cal<-predict(log.nhanes, cal.data, type="prob")
+log.pp.cal<-log.probs.cal[,2]
+
+#Add to dataset with actual values from calibration data
+calib.log.data.frame<-data.frame(log.pp.cal, cal.data$Diabetes)
+colnames(calib.log.data.frame)<-c("x", "y")
+
+#Use logistic regression to model predicted probabilities from calibration data to actual vales
+calib.log.model<-glm(y ~ x, data=calib.log.data.frame, family = binomial)
+
+#Apply calibration model above to raw predicted probabilities from test set
+data.test.log<-data.frame(log.pp.nocal)
+colnames(data.test.log)<-c("x")
+platt.data.log<-predict(calib.log.model, data.test.log, type="response")
+
+platt.prob.log<-data.frame(Class=final.test.data$Diabetes, log.platt=platt.data.log, log=log.pp.nocal)
+
+calplot.log<-(calibration(Class ~ log.platt+log, data=platt.prob.log, class="Yes", cuts=10))
+xyplot(calplot.log, auto.key=list(columns=2))
+```
+
+# Part IV: Discussion
+
+## 4.1 Choosing the "Optimal" Model
+
+
+
+## 4.2 Additional Evaluation for Clinical Settings
+
